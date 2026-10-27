@@ -78,11 +78,14 @@ nt_open_in_nvim() {    # target pane_pid file
   fi
 }
 
-# New and replaced panes start a plain login shell, and nvim is then typed into it.
+# New and replaced panes start a shell, and nvim is then typed into it.
 # Running "zsh -c 'nvim f; exec zsh'" instead would keep zsh as the pane's foreground
 # process, so tmux would report the pane as a shell while nvim is open, and the next
 # call would type "nvim f" into nvim as text.
-NT_LOGIN_SHELL="${SHELL:-/bin/zsh} -l"
+# Use tmux's own default-command when set (here it wraps zsh in
+# reattach-to-user-namespace for the macOS clipboard), otherwise a login shell.
+NT_LOGIN_SHELL=$(tmux show-options -gv default-command 2>/dev/null)
+[ -n "$NT_LOGIN_SHELL" ] || NT_LOGIN_SHELL="${SHELL:-/bin/zsh} -l"
 
 nt_respawn() {         # target file
   local cwd; cwd=$(tmux display-message -p -t "$1" '#{pane_current_path}')
