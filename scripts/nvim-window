@@ -38,7 +38,7 @@ for a in "$@"; do
     --no-focus) NT_FOCUS=0 ;;
     --dry-run) NT_DRY=1 ;;
     --list) LIST=1 ;;
-    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     -*) nt_err "unknown option $a"; exit $NT_USAGE ;;
     *) args+=("$a") ;;
   esac
@@ -50,8 +50,8 @@ SESSION=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#{session_name}
 MYWIN=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#{window_index}')
 
 list_windows() {
-  tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name} #{window_panes} #{pane_current_command} #{?window_active,active,}' |
-  while read -r idx name n cmd act; do
+  tmux list-windows -t "$SESSION" -F "#{window_index}${NT_TAB}#{window_name}${NT_TAB}#{window_panes}${NT_TAB}#{pane_current_command}${NT_TAB}#{?window_active,active,}" |
+  while IFS=$NT_TAB read -r idx name n cmd act; do
     me=""; [ "$idx" = "$MYWIN" ] && me=" (this window)"
     printf '  %-3s %-16s %s pane(s), active pane: %-10s %s%s\n' "$idx" "$name" "$n" "$cmd" "$act" "$me"
   done
@@ -67,6 +67,7 @@ case "${args[0]:-}" in
   *) TARGET=${args[0]} ;;
 esac
 if [ -z "$FILE" ] && [ "${#args[@]}" -ge 2 ]; then FILE=${args[1]}; fi
+nt_check_name "$FILE"
 FILE=$(nt_abs "$FILE")
 
 if [ -z "$TARGET" ]; then
@@ -89,21 +90,23 @@ fi
 case "$TARGET" in *:*) W=$TARGET ;; *) W="$SESSION:$TARGET" ;; esac
 tmux list-windows -a -F '#{session_name}:#{window_index}' | grep -qxF "$W" ||
   { nt_err "window $TARGET not found"; echo "status=not-found target=$TARGET"; exit $NT_NOT_FOUND; }
-PANES=$(tmux list-panes -t "$W" -F '#{pane_active} #{pane_id} #{pane_pid} #{pane_current_command} #{session_name}:#{window_index}.#{pane_index}')
+PANES=$(tmux list-panes -t "$W" -F "#{pane_active}${NT_TAB}#{pane_id}${NT_TAB}#{pane_pid}${NT_TAB}#{pane_current_command}${NT_TAB}#{session_name}:#{window_index}.#{pane_index}")
 
-# Active pane first, then the others in order
-ORDERED=$(printf '%s\n' "$PANES" | sort -k1,1r -s)
-pick() { printf '%s\n' "$ORDERED" | while read -r act id pid cmd full; do
-           [ "$(nt_kind "$cmd")" = "$1" ] && { echo "$id $pid $cmd $full"; break; }; done; }
+# Active pane first, then the others in order. The caller's own pane is never
+# picked: its foreground program is this script (or Claude), not a free shell.
+ORDERED=$(printf '%s\n' "$PANES" | sort -t "$NT_TAB" -k1,1r -s)
+pick() { printf '%s\n' "$ORDERED" | while IFS=$NT_TAB read -r act id pid cmd full; do
+           [ "$id" = "${TMUX_PANE:-}" ] && continue
+           [ "$(nt_kind "$cmd")" = "$1" ] && { printf '%s\t%s\t%s\t%s\n' "$id" "$pid" "$cmd" "$full"; break; }; done; }
 
 if P=$(pick nvim) && [ -n "$P" ]; then
-  read -r ID PID CMD FULL <<< "$P"
+  IFS=$NT_TAB read -r ID PID CMD FULL <<< "$P"
   nt_open_in_nvim "$FULL" "$PID" "$FILE" || exit 1; ACTION=opened-in-nvim
 elif P=$(pick shell) && [ -n "$P" ]; then
-  read -r ID PID CMD FULL <<< "$P"
+  IFS=$NT_TAB read -r ID PID CMD FULL <<< "$P"
   nt_open_in_shell "$FULL" "$FILE" || exit 1; ACTION=started
 else
-  read -r _ ID PID CMD FULL <<< "$(printf '%s\n' "$ORDERED" | head -n 1)"
+  IFS=$NT_TAB read -r _ ID PID CMD FULL <<< "$(printf '%s\n' "$ORDERED" | head -n 1)"
   choice=$BUSY
   if [ "$choice" = kill ] && [ "$ID" = "${TMUX_PANE:-}" ]; then
     nt_err "the active pane of window $W is the pane this command runs in ($CMD); it won't be stopped"

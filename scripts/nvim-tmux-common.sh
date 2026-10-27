@@ -7,6 +7,10 @@ NT_SHELLS=" zsh -zsh bash -bash sh -sh fish dash ksh tcsh csh login "
 # Exit codes shared by both scripts
 NT_OK=0 NT_USAGE=1 NT_NO_TMUX=2 NT_BUSY=3 NT_NEED_TARGET=4 NT_NOT_FOUND=5
 
+# Tab separates tmux format fields, because session names, window names and
+# process names can contain spaces
+NT_TAB=$(printf '\t')
+
 nt_err() { printf '%s: %s\n' "$NT_PROG" "$1" >&2; }
 
 nt_require_tmux() {
@@ -36,6 +40,11 @@ nt_abs() {
 
 nt_q() { printf '%q' "$1"; }
 
+# Refuse file names with control characters: a newline would be sent as Enter
+nt_check_name() {
+  case "$1" in *[[:cntrl:]]*) nt_err "file name contains a control character; refusing to type it"; exit $NT_USAGE ;; esac
+}
+
 # Server socket of the nvim running under a pane's shell. nvim 0.10+ runs a UI
 # process with the server as its child, and the socket is named after the server,
 # so every descendant pid is checked.
@@ -45,7 +54,8 @@ nt_nvim_socket() {
     { kids[$2] = kids[$2] " " $1 }
     END { q = root; while (q != "") { split(q, a, " "); q = "";
             for (i in a) { if (a[i] == "") continue; print a[i]; q = q " " kids[a[i]] } } }')
-  for dir in "${XDG_RUNTIME_DIR:-}" "${TMPDIR%/}/nvim.${USER}"; do
+  local tmp=${TMPDIR:-/tmp}; tmp=${tmp%/}
+  for dir in "${XDG_RUNTIME_DIR:-}" "$tmp/nvim.${USER:-$(id -un)}"; do
     [ -n "$dir" ] && [ -d "$dir" ] || continue
     for pid in $pids; do
       sock=$(find "$dir" -type s -name "nvim.${pid}.*" -print 2>/dev/null | head -n 1)
@@ -55,27 +65,32 @@ nt_nvim_socket() {
   return 1
 }
 
-# Vim's fnameescape for the :edit fallback
-nt_vim_escape() { printf '%s' "$1" | sed -e 's/[ %#|"\\]/\\&/g'; }
+# The path as a Vim single-quoted string (only ' needs doubling), so the :edit
+# fallback can pass it through fnameescape() instead of typing it raw
+nt_vim_string() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
 
 # --- actions (each honours NT_DRY=1) ---
 
 nt_open_in_shell() {   # target file
   local cmd="nvim"; [ -n "$2" ] && cmd="nvim $(nt_q "$2")"
   [ "${NT_DRY:-0}" = 1 ] && { echo "dry-run: type '$cmd' into $1"; return; }
+  # A pane in copy mode or view mode would read the keys as copy-mode commands
+  [ "$(tmux display-message -p -t "$1" '#{pane_in_mode}')" = 1 ] && tmux send-keys -t "$1" -X cancel
   tmux send-keys -t "$1" -l "$cmd" && tmux send-keys -t "$1" Enter
 }
 
 nt_open_in_nvim() {    # target pane_pid file
   [ -z "$3" ] && { [ "${NT_DRY:-0}" = 1 ] && echo "dry-run: nvim already open in $1, nothing to open"; return 0; }
-  local sock; sock=$(nt_nvim_socket "$2")
-  if [ -n "$sock" ]; then
-    [ "${NT_DRY:-0}" = 1 ] && { echo "dry-run: nvim --server $sock --remote $3"; return; }
-    nvim --server "$sock" --remote "$3"
-  else
-    [ "${NT_DRY:-0}" = 1 ] && { echo "dry-run: no nvim socket found; send Escape :e $3 to $1"; return; }
-    tmux send-keys -t "$1" Escape && tmux send-keys -t "$1" -l ":e $(nt_vim_escape "$3")" && tmux send-keys -t "$1" Enter
+  local sock ex; sock=$(nt_nvim_socket "$2")
+  ex=":execute 'edit' fnameescape($(nt_vim_string "$3"))"
+  if [ "${NT_DRY:-0}" = 1 ]; then
+    if [ -n "$sock" ]; then echo "dry-run: nvim --server $sock --remote $3"; else echo "dry-run: no nvim socket found; type Escape $ex into $1"; fi
+    return
   fi
+  # A stale socket makes --remote fail; fall back to typing the :execute command
+  [ -n "$sock" ] && nvim --server "$sock" --remote "$3" 2>/dev/null && return 0
+  [ "$(tmux display-message -p -t "$1" '#{pane_in_mode}')" = 1 ] && tmux send-keys -t "$1" -X cancel
+  tmux send-keys -t "$1" Escape && tmux send-keys -t "$1" -l "$ex" && tmux send-keys -t "$1" Enter
 }
 
 # New and replaced panes start a shell, and nvim is then typed into it.
