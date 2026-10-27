@@ -1,0 +1,136 @@
+#!/bin/bash
+# nvim-window: open a file in nvim in a tmux window of the current session.
+#
+#   nvim-window [options] [WINDOW|new] [FILE]
+#
+# WINDOW is a window number in the current session, or a full target such as work:2.
+# "new" opens a new window. With no WINDOW you are asked which window to use (or "n"
+# for a new one).
+#
+# The script checks every pane in the window and picks the first match:
+#   1. a pane running nvim (the active pane first) -> opens FILE in that nvim
+#   2. a pane at a shell prompt (the active pane first) -> types "nvim FILE" into it
+#   3. otherwise the window is busy: ask, or follow --busy:
+#        kill   = stop the program in the active pane and start nvim there
+#        pane   = add a new pane to that window
+#        window = open a new window
+#
+# Options:
+#   --busy=ask|kill|pane|window|abort   (default ask)
+#   --split=h|v                         direction for a new pane (default h)
+#   --no-focus                          don't switch to the window afterwards
+#   --dry-run                           print what would happen, change nothing
+#   --list                              list the windows in the current session and exit
+#   -h, --help
+#
+# Exit codes: 0 done, 1 usage, 2 not in tmux, 3 window busy (no decision), 4 no
+# window given and no terminal to ask in, 5 window not found. Status lines on stdout
+# start with "status=".
+set -u
+. "$(dirname "$(readlink -f "$0")")/nvim-tmux-common.sh"
+
+BUSY=ask SPLIT=h NT_FOCUS=1 NT_DRY=0 LIST=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    --busy=*) BUSY=${a#--busy=} ;;
+    --split=h|--split=v) SPLIT=${a#--split=} ;;
+    --no-focus) NT_FOCUS=0 ;;
+    --dry-run) NT_DRY=1 ;;
+    --list) LIST=1 ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
+    -*) nt_err "unknown option $a"; exit $NT_USAGE ;;
+    *) args+=("$a") ;;
+  esac
+done
+case "$BUSY" in ask|kill|pane|window|abort) ;; *) nt_err "--busy must be ask, kill, pane, window or abort"; exit $NT_USAGE ;; esac
+
+nt_require_tmux
+SESSION=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#{session_name}')
+MYWIN=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#{window_index}')
+
+list_windows() {
+  tmux list-windows -t "$SESSION" -F "#{window_index}${NT_TAB}#{window_name}${NT_TAB}#{window_panes}${NT_TAB}#{pane_current_command}${NT_TAB}#{?window_active,active,}" |
+  while IFS=$NT_TAB read -r idx name n cmd act; do
+    me=""; [ "$idx" = "$MYWIN" ] && me=" (this window)"
+    printf '  %-3s %-16s %s pane(s), active pane: %-10s %s%s\n' "$idx" "$name" "$n" "$cmd" "$act" "$me"
+  done
+}
+
+if [ "$LIST" = 1 ]; then echo "Windows in session $SESSION:"; list_windows; exit 0; fi
+
+TARGET="" FILE=""
+case "${args[0]:-}" in
+  "") ;;
+  new|n) TARGET=new ;;
+  *[!0-9]*) case "${args[0]}" in *:*) TARGET=${args[0]} ;; *) FILE=${args[0]} ;; esac ;;
+  *) TARGET=${args[0]} ;;
+esac
+if [ -z "$FILE" ] && [ "${#args[@]}" -ge 2 ]; then FILE=${args[1]}; fi
+nt_check_name "$FILE"
+FILE=$(nt_abs "$FILE")
+
+if [ -z "$TARGET" ]; then
+  if nt_interactive; then
+    echo "Windows in session $SESSION:"; list_windows
+    read -r -p "Window number, or n for a new window: " TARGET
+    [ -n "$TARGET" ] || { nt_err "no window chosen"; exit $NT_USAGE; }
+    [ "$TARGET" = n ] && TARGET=new
+  else
+    echo "status=need-target session=$SESSION"; list_windows; exit $NT_NEED_TARGET
+  fi
+fi
+
+if [ "$TARGET" = new ]; then
+  NEW=$(nt_new_window "$SESSION" "$FILE") || exit 1
+  nt_focus "$NEW"; echo "status=opened action=new-window target=$NEW file=${FILE:-}"; exit 0
+fi
+
+# Match exactly against the real windows (tmux may resolve a missing index to another window)
+case "$TARGET" in *:*) W=$TARGET ;; *) W="$SESSION:$TARGET" ;; esac
+tmux list-windows -a -F '#{session_name}:#{window_index}' | grep -qxF "$W" ||
+  { nt_err "window $TARGET not found"; echo "status=not-found target=$TARGET"; exit $NT_NOT_FOUND; }
+PANES=$(tmux list-panes -t "$W" -F "#{pane_active}${NT_TAB}#{pane_id}${NT_TAB}#{pane_pid}${NT_TAB}#{pane_current_command}${NT_TAB}#{session_name}:#{window_index}.#{pane_index}")
+
+# Active pane first, then the others in order. The caller's own pane is never
+# picked: its foreground program is this script (or Claude), not a free shell.
+ORDERED=$(printf '%s\n' "$PANES" | sort -t "$NT_TAB" -k1,1r -s)
+pick() { printf '%s\n' "$ORDERED" | while IFS=$NT_TAB read -r act id pid cmd full; do
+           [ "$id" = "${TMUX_PANE:-}" ] && continue
+           [ "$(nt_kind "$cmd")" = "$1" ] && { printf '%s\t%s\t%s\t%s\n' "$id" "$pid" "$cmd" "$full"; break; }; done; }
+
+if P=$(pick nvim) && [ -n "$P" ]; then
+  IFS=$NT_TAB read -r ID PID CMD FULL <<< "$P"
+  nt_open_in_nvim "$FULL" "$PID" "$FILE" || exit 1; ACTION=opened-in-nvim
+elif P=$(pick shell) && [ -n "$P" ]; then
+  IFS=$NT_TAB read -r ID PID CMD FULL <<< "$P"
+  nt_open_in_shell "$FULL" "$FILE" || exit 1; ACTION=started
+else
+  IFS=$NT_TAB read -r _ ID PID CMD FULL <<< "$(printf '%s\n' "$ORDERED" | head -n 1)"
+  choice=$BUSY
+  if [ "$choice" = kill ] && [ "$ID" = "${TMUX_PANE:-}" ]; then
+    nt_err "the active pane of window $W is the pane this command runs in ($CMD); it won't be stopped"
+    echo "status=busy target=$W command=$CMD self=yes"; exit $NT_BUSY
+  fi
+  if [ "$choice" = ask ]; then
+    if nt_interactive; then
+      read -r -p "Window $W has no shell or nvim pane (active pane runs $CMD). [k]ill it, new [p]ane, new [w]indow, or [a]bort? " c
+      case "$c" in k*) choice=kill ;; p*) choice=pane ;; w*) choice=window ;; *) choice=abort ;; esac
+      if [ "$choice" = kill ] && [ "$ID" = "${TMUX_PANE:-}" ]; then
+        nt_err "that is the pane this command runs in; it won't be stopped"; exit $NT_BUSY
+      fi
+    else
+      echo "status=busy target=$W command=$CMD"; exit $NT_BUSY
+    fi
+  fi
+  case "$choice" in
+    kill)   nt_respawn "$FULL" "$FILE" || exit 1; ACTION="replaced-$CMD" ;;
+    pane)   NEW=$(nt_split "$W" "$FILE" "$SPLIT") || exit 1
+            nt_focus "$NEW"; echo "status=opened action=new-pane target=$NEW file=${FILE:-}"; exit 0 ;;
+    window) NEW=$(nt_new_window "$SESSION" "$FILE") || exit 1
+            nt_focus "$NEW"; echo "status=opened action=new-window target=$NEW file=${FILE:-}"; exit 0 ;;
+    *)      echo "status=aborted target=$W command=$CMD"; exit $NT_BUSY ;;
+  esac
+fi
+nt_focus "$FULL"
+echo "status=opened action=$ACTION target=$FULL was=$CMD file=${FILE:-}"

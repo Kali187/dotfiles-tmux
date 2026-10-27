@@ -1,0 +1,122 @@
+#!/bin/bash
+# nvim-pane: open a file in nvim in a tmux pane of the current window.
+#
+#   nvim-pane [options] [PANE|new] [FILE]
+#
+# PANE is a pane number in the current window (pane-base-index is respected, since
+# tmux reports real indexes), or a full target such as 0:1.2 or %3. "new" splits the
+# current window. With no PANE you are asked which pane to use (or "n" for a new one).
+#
+# What happens depends on what the pane runs:
+#   shell  -> types "nvim FILE" into it
+#   nvim   -> opens FILE in that nvim (through its server socket, or :e as a fallback)
+#   other  -> busy: ask, or follow --busy (kill = stop it and start nvim, new = new pane)
+#
+# Options:
+#   --busy=ask|kill|new|abort   what to do when the pane runs another program (default ask)
+#   --split=h|v                 direction for a new pane (default h, side by side)
+#   --no-focus                  don't switch to the pane afterwards
+#   --dry-run                   print what would happen, change nothing
+#   --list                      list the panes in the current window and exit
+#   -h, --help
+#
+# Exit codes: 0 done, 1 usage, 2 not in tmux, 3 pane busy (no decision), 4 no pane
+# given and no terminal to ask in, 5 pane not found. Status lines on stdout start
+# with "status=" so other tools (the Claude skill) can read them.
+set -u
+. "$(dirname "$(readlink -f "$0")")/nvim-tmux-common.sh"
+
+BUSY=ask SPLIT=h NT_FOCUS=1 NT_DRY=0 LIST=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    --busy=*) BUSY=${a#--busy=} ;;
+    --split=h|--split=v) SPLIT=${a#--split=} ;;
+    --no-focus) NT_FOCUS=0 ;;
+    --dry-run) NT_DRY=1 ;;
+    --list) LIST=1 ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
+    -*) nt_err "unknown option $a"; exit $NT_USAGE ;;
+    *) args+=("$a") ;;
+  esac
+done
+case "$BUSY" in ask|kill|new|abort) ;; *) nt_err "--busy must be ask, kill, new or abort"; exit $NT_USAGE ;; esac
+
+nt_require_tmux
+HERE=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#{session_name}:#{window_index}')
+
+list_panes() {
+  tmux list-panes -t "$HERE" -F "#{pane_index}${NT_TAB}#{pane_id}${NT_TAB}#{pane_current_command}${NT_TAB}#{?pane_active,active,}" |
+  while IFS=$NT_TAB read -r idx id cmd act; do
+    me=""; [ "$id" = "${TMUX_PANE:-}" ] && me=" (this pane)"
+    printf '  %-3s %-12s %-6s %s%s\n' "$idx" "$cmd" "$(nt_kind "$cmd")" "$act" "$me"
+  done
+}
+
+if [ "$LIST" = 1 ]; then echo "Panes in window $HERE:"; list_panes; exit 0; fi
+
+TARGET="" FILE=""
+case "${args[0]:-}" in
+  "") ;;
+  new|n) TARGET=new ;;
+  *[!0-9]*) case "${args[0]}" in *:*|%*) TARGET=${args[0]} ;; *) FILE=${args[0]} ;; esac ;;
+  *) TARGET=${args[0]} ;;
+esac
+if [ -z "$FILE" ] && [ "${#args[@]}" -ge 2 ]; then FILE=${args[1]}; fi
+nt_check_name "$FILE"
+FILE=$(nt_abs "$FILE")
+
+if [ -z "$TARGET" ]; then
+  if nt_interactive; then
+    echo "Panes in window $HERE:"; list_panes
+    read -r -p "Pane number, or n for a new pane: " TARGET
+    [ -n "$TARGET" ] || { nt_err "no pane chosen"; exit $NT_USAGE; }
+    [ "$TARGET" = n ] && TARGET=new
+  else
+    echo "status=need-target window=$HERE"; list_panes; exit $NT_NEED_TARGET
+  fi
+fi
+
+if [ "$TARGET" = new ]; then
+  NEW=$(nt_split "$HERE" "$FILE" "$SPLIT") || exit 1
+  nt_focus "$NEW"; echo "status=opened action=new-pane target=$NEW file=${FILE:-}"; exit 0
+fi
+
+# Match exactly against the real panes: tmux resolves a missing pane index to some
+# other pane instead of failing, so display-message -t can't be trusted for this.
+case "$TARGET" in *:*|%*) T=$TARGET ;; *) T="$HERE.$TARGET" ;; esac
+INFO=$(tmux list-panes -a -F "#{pane_id}${NT_TAB}#{pane_pid}${NT_TAB}#{pane_current_command}${NT_TAB}#{session_name}:#{window_index}.#{pane_index}" |
+       awk -F "$NT_TAB" -v t="$T" '$1 == t || $4 == t { print; exit }')
+[ -n "$INFO" ] || { nt_err "pane $TARGET not found"; echo "status=not-found target=$TARGET"; exit $NT_NOT_FOUND; }
+IFS=$NT_TAB read -r ID PID CMD FULL <<< "$INFO"
+KIND=$(nt_kind "$CMD")
+
+# Never act on the pane this command runs in: its foreground program is this script
+# (or Claude), so typing into it or stopping it would hit the caller itself
+if [ "$ID" = "${TMUX_PANE:-}" ]; then
+  nt_err "pane $FULL is the pane this command runs in ($CMD); choose another pane or n"
+  echo "status=busy target=$FULL command=$CMD self=yes"; exit $NT_BUSY
+fi
+
+case "$KIND" in
+  shell) nt_open_in_shell "$FULL" "$FILE" || exit 1; ACTION=started ;;
+  nvim)  nt_open_in_nvim "$FULL" "$PID" "$FILE" || exit 1; ACTION=opened-in-nvim ;;
+  other)
+    choice=$BUSY
+    if [ "$choice" = ask ]; then
+      if nt_interactive; then
+        read -r -p "Pane $FULL runs $CMD. [k]ill it and start nvim, open a [n]ew pane, or [a]bort? " c
+        case "$c" in k*) choice=kill ;; n*) choice=new ;; *) choice=abort ;; esac
+      else
+        echo "status=busy target=$FULL command=$CMD"; exit $NT_BUSY
+      fi
+    fi
+    case "$choice" in
+      kill) nt_respawn "$FULL" "$FILE" || exit 1; ACTION="replaced-$CMD" ;;
+      new)  NEW=$(nt_split "$HERE" "$FILE" "$SPLIT") || exit 1
+            nt_focus "$NEW"; echo "status=opened action=new-pane target=$NEW file=${FILE:-}"; exit 0 ;;
+      *)    echo "status=aborted target=$FULL command=$CMD"; exit $NT_BUSY ;;
+    esac ;;
+esac
+nt_focus "$FULL"
+echo "status=opened action=$ACTION target=$FULL was=$CMD file=${FILE:-}"
